@@ -49,6 +49,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.bandbbs.ebook.ui.viewmodel.ImportState
 import com.bandbbs.ebook.utils.ChapterSplitter
+import androidx.compose.foundation.layout.fillMaxWidth
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,11 +58,10 @@ fun ImportBookBottomSheet(
     onCancel: () -> Unit,
     onConfirm: (bookName: String, splitMethod: String, noSplit: Boolean, wordsPerChapter: Int) -> Unit
 ) {
-    val isFileTooLarge = state.fileSize > 1.8 * 1024 * 1024
     var bookName by remember { mutableStateOf(state.bookName) }
     var splitMethod by remember { mutableStateOf(state.splitMethod) }
     var showSplitMethodMenu by remember { mutableStateOf(false) }
-    var noSplit by remember { mutableStateOf(if (isFileTooLarge) false else state.noSplit) }
+    var noSplit by remember { mutableStateOf(state.noSplit) }
     var wordsPerChapterText by remember { mutableStateOf(state.wordsPerChapter.toString()) }
 
     Column(
@@ -93,7 +93,24 @@ fun ImportBookBottomSheet(
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(
+                text = "支持 EPUB、TXT 和 NVB 格式的书籍",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.padding(12.dp),
+                textAlign = TextAlign.Center
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
 
         OutlinedTextField(
             value = bookName,
@@ -117,14 +134,13 @@ fun ImportBookBottomSheet(
         Spacer(modifier = Modifier.height(12.dp))
 
         Row(
-            modifier = Modifier.fillMaxWidth().clickable(enabled = !isFileTooLarge) { noSplit = !noSplit },
+            modifier = Modifier.fillMaxWidth().clickable { noSplit = !noSplit },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Checkbox(
                 checked = noSplit,
-                onCheckedChange = { noSplit = it },
-                enabled = !isFileTooLarge
+                onCheckedChange = { noSplit = it }
             )
             Column {
                 Text(
@@ -132,9 +148,9 @@ fun ImportBookBottomSheet(
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 Text(
-                    text = if (isFileTooLarge) "文件大于1.8MB，必须分章" else "将整本书作为单个章节导入",
+                    text = "将整本书作为单个章节导入",
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (isFileTooLarge) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
