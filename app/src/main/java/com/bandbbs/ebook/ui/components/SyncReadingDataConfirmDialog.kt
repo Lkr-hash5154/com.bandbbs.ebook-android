@@ -7,7 +7,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -30,7 +30,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 
 @Composable
-fun FirstSyncConfirmDialog(
+fun SyncReadingDataConfirmDialog(
     onConfirm: () -> Unit,
     onCancel: () -> Unit
 ) {
@@ -49,18 +49,17 @@ fun FirstSyncConfirmDialog(
         onDismissRequest = onCancel,
         icon = {
             Icon(
-                imageVector = Icons.Filled.Warning,
+                imageVector = Icons.Filled.Info,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.error,
+                tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.padding(bottom = 8.dp)
             )
         },
         title = {
             Text(
-                text = "同步确认",
+                text = "同步数据确认",
                 style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.error
+                fontWeight = FontWeight.Bold
             )
         },
         text = {
@@ -70,7 +69,7 @@ fun FirstSyncConfirmDialog(
             ) {
                 Card(
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f)
+                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.8f)
                     ),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -80,9 +79,9 @@ fun FirstSyncConfirmDialog(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = "由于Vela优化问题，同步书籍时手环重启为正常现象，开机后继续同步即可。\n首次同步报错为正常现象。\n若某书籍同步一直报错，可删除书籍重新导入再试。",
+                            text = "此功能用于同步阅读进度和阅读时长，\n不是同步书籍文件。\n如需传输书籍文件，请使用书籍卡片中的\"传输书籍\"功能。",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
                             textAlign = TextAlign.Center
                         )
                     }

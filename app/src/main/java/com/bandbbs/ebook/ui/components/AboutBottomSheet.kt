@@ -2,7 +2,6 @@ package com.bandbbs.ebook.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,7 +22,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
 @Composable
-fun AboutBottomSheet() {
+fun AboutBottomSheet(
+    onCheckUpdate: () -> Unit = {}
+) {
     val context = LocalContext.current
     val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
     val versionName = packageInfo.versionName
@@ -94,7 +95,7 @@ fun AboutBottomSheet() {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                
+
                 Column {
                     Text(
                         "《喵喵电子书》开发人员",
@@ -108,7 +109,7 @@ fun AboutBottomSheet() {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                
+
                 Column {
                     Text(
                         "QQ交流群",
@@ -122,7 +123,7 @@ fun AboutBottomSheet() {
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
-                
+
                 Column {
                     Text(
                         "更多资源请访问",

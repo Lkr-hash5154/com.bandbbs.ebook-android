@@ -1,0 +1,691 @@
+package com.bandbbs.ebook.ui.viewmodel.handlers
+
+import android.content.SharedPreferences
+import android.util.Log
+import com.bandbbs.ebook.database.AppDatabase
+import com.bandbbs.ebook.ui.model.Book
+import com.bandbbs.ebook.ui.viewmodel.PushState
+import com.bandbbs.ebook.ui.viewmodel.SyncOptionsState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import android.content.Context
+import com.bandbbs.ebook.notifications.ForegroundTransferService
+import com.bandbbs.ebook.notifications.LiveNotificationManager
+
+class PushHandler(
+    private val db: AppDatabase,
+    private val prefs: SharedPreferences,
+    private val scope: CoroutineScope,
+    private val pushState: MutableStateFlow<PushState>,
+    private val syncOptionsState: MutableStateFlow<SyncOptionsState?>,
+    private val firstSyncConfirmState: MutableStateFlow<Book?>,
+    private val connectionHandler: ConnectionHandler,
+    private val firstSyncConfirmedKey: String,
+    private val appContext: Context,
+    private val autoRetryOnTransferError: StateFlow<Boolean>
+) {
+
+    private var pendingPushBook: Book? = null
+    private var pendingPushChapters: Set<Int>? = null
+    private var pendingSyncCover: Boolean = false
+
+    private var currentTransferBook: Book? = null
+    private var currentTransferChapters: List<Int>? = null
+    private var currentTransferSyncCover: Boolean = false
+    private var currentTransferIsCoverAlreadySynced: Boolean = false
+    private var currentTransferChapterIndex: Int = 0
+    private var isRetrying: Boolean = false
+
+    fun startPush(book: Book) {
+        val fileConn = runCatching { connectionHandler.getFileConnection() }.getOrElse { return }
+        if (fileConn.busy || syncOptionsState.value != null) return
+
+        syncOptionsState.value = SyncOptionsState(book, 0, emptySet(), emptyList(), false)
+
+        scope.launch {
+            try {
+                connectionHandler.reconnect()
+
+                delay(500L)
+
+                val conn = connectionHandler.getHandshake()
+                conn.init()
+                delay(500L)
+                val bookStatus = withContext(Dispatchers.IO) {
+                    fileConn.getBookStatus(book.name)
+                }
+                val (totalChapters, chapters, hasCover) = withContext(Dispatchers.IO) {
+                    val bookEntity = db.bookDao().getBookByPath(book.path)
+                    if (bookEntity != null) {
+                        val count = db.chapterDao().getChapterCountForBook(bookEntity.id)
+                        val chapterList = db.chapterDao().getChapterInfoForBook(bookEntity.id)
+                        val hasCoverImage = bookEntity.coverImagePath != null
+                        Triple(count, chapterList, hasCoverImage)
+                    } else {
+                        Triple(0, emptyList(), false)
+                    }
+                }
+                syncOptionsState.value = SyncOptionsState(
+                    book = book,
+                    totalChapters = totalChapters,
+                    syncedChapterIndices = bookStatus.syncedChapters.toSet(),
+                    chapters = chapters,
+                    hasCover = hasCover,
+                    isCoverSynced = bookStatus.hasCover
+                )
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Failed to get book status", e)
+                pushState.update {
+                    it.copy(
+                        statusText = "获取手环状态失败: ${e.message}",
+                        isFinished = true,
+                        isSuccess = false,
+                        book = book
+                    )
+                }
+                syncOptionsState.value = null
+            }
+        }
+    }
+
+    fun refreshBookStatus(book: Book) {
+        scope.launch {
+            try {
+                connectionHandler.reconnect()
+                delay(500L)
+                val conn = connectionHandler.getHandshake()
+                conn.init()
+                delay(500L)
+                val fileConn = connectionHandler.getFileConnection()
+                val bookStatus = withContext(Dispatchers.IO) {
+                    fileConn.getBookStatus(book.name)
+                }
+                val (totalChapters, chapters, hasCover) = withContext(Dispatchers.IO) {
+                    val bookEntity = db.bookDao().getBookByPath(book.path)
+                    if (bookEntity != null) {
+                        val count = db.chapterDao().getChapterCountForBook(bookEntity.id)
+                        val chapterList = db.chapterDao().getChapterInfoForBook(bookEntity.id)
+                        val hasCoverImage = bookEntity.coverImagePath != null
+                        Triple(count, chapterList, hasCoverImage)
+                    } else {
+                        Triple(0, emptyList(), false)
+                    }
+                }
+                syncOptionsState.value?.let { currentState ->
+                    syncOptionsState.value = currentState.copy(
+                        syncedChapterIndices = bookStatus.syncedChapters.toSet(),
+                        chapters = chapters,
+                        hasCover = hasCover,
+                        isCoverSynced = bookStatus.hasCover
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("PushHandler", "Failed to refresh book status", e)
+            }
+        }
+    }
+
+    private fun addTransferLog(message: String) {
+        pushState.update { state ->
+            val newLog = (state.transferLog + message).takeLast(100)
+            state.copy(transferLog = newLog)
+        }
+    }
+
+    fun syncCoverOnly(book: Book) {
+        val fileConn = runCatching { connectionHandler.getFileConnection() }.getOrElse { return }
+        if (fileConn.busy || book.coverImagePath == null) return
+
+        val initialLog = listOf("准备传输封面...")
+        pushState.value =
+            PushState(book = book, preview = "准备传输封面...", transferLog = initialLog)
+
+        scope.launch {
+            fileConn.sendCoverOnly(
+                book = book,
+                coverImagePath = book.coverImagePath,
+                onError = { error, _ ->
+                    addTransferLog("[错误] 封面同步失败: $error")
+                    pushState.update {
+                        it.copy(
+                            statusText = "封面同步失败: $error",
+                            isFinished = true,
+                            isSuccess = false
+                        )
+                    }
+                },
+                onSuccess = { _, _ ->
+                    addTransferLog("[成功] 封面同步完成")
+                    pushState.update {
+                        it.copy(
+                            statusText = "封面同步成功",
+                            progress = 1.0,
+                            isFinished = true,
+                            isSuccess = true
+                        )
+                    }
+                },
+                onCoverProgress = { current, total ->
+                    if (total > 0) {
+                        val logMessage = "传输封面分块: $current/$total"
+                        addTransferLog(logMessage)
+                        pushState.update {
+                            it.copy(
+                                isSendingCover = true,
+                                coverProgress = "封面: $current/$total",
+                                statusText = "正在同步封面..."
+                            )
+                        }
+                    } else {
+                        pushState.update {
+                            it.copy(isSendingCover = false, coverProgress = "")
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+    fun confirmPush(book: Book, selectedChapterIndices: Set<Int>, syncCover: Boolean = false) {
+        if (selectedChapterIndices.isEmpty()) {
+            return
+        }
+
+        val hasConfirmedFirstSync = prefs.getBoolean(firstSyncConfirmedKey, false)
+        if (!hasConfirmedFirstSync) {
+            pendingPushBook = book
+            pendingPushChapters = selectedChapterIndices
+            pendingSyncCover = syncCover
+            firstSyncConfirmState.value = book
+            return
+        }
+
+        scope.launch {
+            delay(500L)
+
+            val isCoverAlreadySynced = syncOptionsState.value?.isCoverSynced ?: false
+            syncOptionsState.value = null
+            performPush(book, selectedChapterIndices, syncCover, isCoverAlreadySynced)
+        }
+    }
+
+    fun confirmFirstSync() {
+        prefs.edit().putBoolean(firstSyncConfirmedKey, true).apply()
+        firstSyncConfirmState.value = null
+
+        val book = pendingPushBook
+        val chapters = pendingPushChapters
+        val syncCover = pendingSyncCover
+
+        pendingPushBook = null
+        pendingPushChapters = null
+        pendingSyncCover = false
+
+        if (book != null && chapters != null && chapters.isNotEmpty()) {
+            scope.launch {
+                val isCoverAlreadySynced = syncOptionsState.value?.isCoverSynced ?: false
+                syncOptionsState.value = null
+                performPush(book, chapters, syncCover, isCoverAlreadySynced)
+            }
+        }
+    }
+
+    fun cancelFirstSyncConfirm() {
+        firstSyncConfirmState.value = null
+        pendingPushBook = null
+        pendingPushChapters = null
+        pendingSyncCover = false
+    }
+
+    private fun performPush(
+        book: Book,
+        selectedChapterIndices: Set<Int>,
+        syncCover: Boolean,
+        isCoverAlreadySynced: Boolean
+    ) {
+        val fileConn = runCatching { connectionHandler.getFileConnection() }.getOrElse { return }
+
+        val initialMessage =
+            if (syncCover && !isCoverAlreadySynced) "准备传输封面..." else "准备开始传输..."
+        val initialLog = listOf(initialMessage)
+        pushState.value = PushState(
+            book = book,
+            preview = initialMessage,
+            transferLog = initialLog,
+            isTransferring = true
+        )
+        ForegroundTransferService.startService(
+            appContext,
+            "传输中",
+            initialMessage,
+            null
+        )
+        LiveNotificationManager.showTransferNotification("传输中", initialMessage, null)
+
+        scope.launch(Dispatchers.IO) {
+            val bookEntity = db.bookDao().getBookByPath(book.path) ?: return@launch
+
+            val sortedIndices = selectedChapterIndices.sorted()
+            if (sortedIndices.isEmpty()) {
+                withContext(Dispatchers.Main) {
+                    addTransferLog("[完成] 没有需要同步的章节")
+                    pushState.update {
+                        it.copy(
+                            statusText = "没有需要同步的章节",
+                            isFinished = true,
+                            isSuccess = true,
+                            isTransferring = false
+                        )
+                    }
+                }
+                return@launch
+            }
+
+            currentTransferBook = book
+            currentTransferChapters = sortedIndices
+            currentTransferSyncCover = syncCover
+            currentTransferIsCoverAlreadySynced = isCoverAlreadySynced
+            currentTransferChapterIndex = 0
+
+            val firstChapterName = db.chapterDao().getChapterInfoForBook(bookEntity.id)
+                .find { it.index == sortedIndices.first() }?.name ?: ""
+
+            val startFromIndex = sortedIndices.first()
+            val totalChaptersInBook = db.chapterDao().getChapterCountForBook(bookEntity.id)
+
+            val coverImagePath =
+                if (syncCover && !isCoverAlreadySynced) bookEntity.coverImagePath else null
+
+            withContext(Dispatchers.Main) {
+                addTransferLog("开始传输，共 ${sortedIndices.size} 章")
+                if (coverImagePath != null) {
+                    addTransferLog("包含封面图片")
+                }
+
+                fileConn.sentChapters(
+                    book = book,
+                    bookId = bookEntity.id,
+                    chaptersIndicesToSend = sortedIndices,
+                    chapterDao = db.chapterDao(),
+                    totalChaptersInBook = totalChaptersInBook,
+                    startFromIndex = startFromIndex,
+                    firstChapterName = firstChapterName,
+                    coverImagePath = coverImagePath,
+                    bookEntity = bookEntity,
+                    onError = { error, count ->
+                        if (autoRetryOnTransferError.value && !isRetrying && currentTransferBook != null && currentTransferChapters != null) {
+                            isRetrying = true
+                            addTransferLog("[中断] 传输中断: $error (章节索引: $count)")
+                            addTransferLog("[重试] 5秒后尝试重连...")
+                            pushState.update {
+                                it.copy(
+                                    statusText = "传输中断，正在重试...",
+                                    isTransferring = true
+                                )
+                            }
+                            ForegroundTransferService.startService(appContext, "重试中", "传输中断，5秒后重连...", null)
+                            LiveNotificationManager.showTransferNotification("重试中", "传输中断，5秒后重连...", null)
+                            scope.launch {
+                                retryTransfer(count)
+                            }
+                        } else {
+                            addTransferLog("[错误] 传输失败: $error (章节索引: $count)")
+                            pushState.update {
+                                it.copy(
+                                    statusText = "传输失败: $error",
+                                    isFinished = true,
+                                    isSuccess = false,
+                                    isTransferring = false
+                                )
+                            }
+                            ForegroundTransferService.stopService(appContext)
+                            resetTransferState()
+                        }
+                    },
+                    onSuccess = { message, count ->
+                        addTransferLog("[成功] $message，共传输 $count 章")
+                        pushState.update {
+                            it.copy(
+                                statusText = "传输成功",
+                                progress = 1.0,
+                                isFinished = true,
+                                isSuccess = true,
+                                isTransferring = false
+                            )
+                        }
+                        ForegroundTransferService.stopService(appContext)
+                        resetTransferState()
+                    },
+                    onProgress = { p, preview, speed ->
+                        val progressPercent = (p * 100).toInt()
+                        val logMessage = if (preview.isNotEmpty()) {
+                            "[$progressPercent%] $preview"
+                        } else {
+                            "[$progressPercent%] 传输中"
+                        }
+                        addTransferLog(logMessage)
+                        pushState.update {
+                            it.copy(
+                                progress = p,
+                                preview = preview,
+                                speed = speed,
+                                statusText = "正在推送 $progressPercent%",
+                                isTransferring = true
+                            )
+                        }
+                        val title = "$progressPercent%"
+                        ForegroundTransferService.startService(appContext, title, preview, progressPercent)
+                        LiveNotificationManager.showTransferNotification(title, preview, progressPercent)
+                        
+                        if (sortedIndices.isNotEmpty() && p > 0) {
+                            val currentIndex = (p * sortedIndices.size).toInt().coerceAtMost(sortedIndices.size - 1)
+                            currentTransferChapterIndex = sortedIndices[currentIndex]
+                        }
+                    },
+                    onCoverProgress = { current, total ->
+                        if (total > 0) {
+                            val logMessage = "传输封面分块: $current/$total"
+                            addTransferLog(logMessage)
+                            pushState.update {
+                                it.copy(
+                                    isSendingCover = true,
+                                    coverProgress = "封面: $current/$total",
+                                    isTransferring = true
+                                )
+                            }
+                        } else {
+                            pushState.update {
+                                it.copy(isSendingCover = false, coverProgress = "")
+                            }
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private suspend fun retryTransfer(failedChapterIndex: Int) {
+        val maxRetryCount = 10
+        var retryCount = 0
+        while (isRetrying && currentTransferBook != null && currentTransferChapters != null && retryCount < maxRetryCount) {
+            retryCount++
+            withContext(Dispatchers.Main) {
+                ForegroundTransferService.startService(appContext, "重试中", "等待重连... (第${retryCount}/${maxRetryCount}次)", null)
+                LiveNotificationManager.showTransferNotification("重试中", "等待重连... (第${retryCount}/${maxRetryCount}次)", null)
+            }
+            delay(5000)
+            
+            if (!isRetrying) break
+            
+            try {
+                withContext(Dispatchers.Main) {
+                    ForegroundTransferService.startService(appContext, "重试中", "正在重连...", null)
+                    LiveNotificationManager.showTransferNotification("重试中", "正在重连...", null)
+                }
+                connectionHandler.reconnect()
+                delay(500)
+                
+                val conn = connectionHandler.getHandshake()
+                conn.init()
+                delay(500)
+                
+                val fileConn = connectionHandler.getFileConnection()
+                
+                val book = currentTransferBook!!
+                val sortedIndices = currentTransferChapters!!
+                val syncCover = currentTransferSyncCover
+                val isCoverAlreadySynced = currentTransferIsCoverAlreadySynced
+                
+                val bookEntity = db.bookDao().getBookByPath(book.path)
+                if (bookEntity == null) {
+                    withContext(Dispatchers.Main) {
+                        addTransferLog("[错误] 无法找到书籍信息")
+                        pushState.update {
+                            it.copy(
+                                statusText = "重试失败: 无法找到书籍信息",
+                                isFinished = true,
+                                isSuccess = false,
+                                isTransferring = false
+                            )
+                        }
+                        ForegroundTransferService.startService(appContext, "重试失败", "无法找到书籍信息", null)
+                        LiveNotificationManager.showTransferNotification("重试失败", "无法找到书籍信息", null)
+                        delay(2000)
+                        ForegroundTransferService.stopService(appContext)
+                    }
+                    resetTransferState()
+                    return
+                }
+                
+                val totalChaptersInBook = db.chapterDao().getChapterCountForBook(bookEntity.id)
+                
+                val failedIndexInList = if (failedChapterIndex >= 0 && sortedIndices.contains(failedChapterIndex)) {
+                    sortedIndices.indexOf(failedChapterIndex)
+                } else {
+                    val currentIndex = if (currentTransferChapterIndex > 0 && sortedIndices.contains(currentTransferChapterIndex)) {
+                        sortedIndices.indexOf(currentTransferChapterIndex)
+                    } else {
+                        0
+                    }
+                    currentIndex
+                }
+                val retryStartIndex = (failedIndexInList - 10).coerceAtLeast(0)
+                val retryChapters = sortedIndices.subList(retryStartIndex, sortedIndices.size)
+                
+                if (retryChapters.isEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        addTransferLog("[错误] 重试章节列表为空")
+                        pushState.update {
+                            it.copy(
+                                statusText = "重试失败: 章节列表为空",
+                                isFinished = true,
+                                isSuccess = false,
+                                isTransferring = false
+                            )
+                        }
+                        ForegroundTransferService.startService(appContext, "重试失败", "章节列表为空", null)
+                        LiveNotificationManager.showTransferNotification("重试失败", "章节列表为空", null)
+                        delay(2000)
+                        ForegroundTransferService.stopService(appContext)
+                    }
+                    resetTransferState()
+                    return
+                }
+                
+                val retryStartFromIndex = retryChapters.first()
+                val firstChapterName = db.chapterDao().getChapterInfoForBook(bookEntity.id)
+                    .find { it.index == retryStartFromIndex }?.name ?: ""
+                
+                val coverImagePath = if (syncCover && !isCoverAlreadySynced) bookEntity.coverImagePath else null
+                
+                withContext(Dispatchers.Main) {
+                    addTransferLog("[重连] 重连成功，从第 ${retryStartIndex + 1} 章重新开始传输（共 ${retryChapters.size} 章）")
+                    pushState.update {
+                        it.copy(
+                            statusText = "重连成功，继续传输...",
+                            isTransferring = true
+                        )
+                    }
+                    
+                    fileConn.sentChapters(
+                        book = book,
+                        bookId = bookEntity.id,
+                        chaptersIndicesToSend = retryChapters,
+                        chapterDao = db.chapterDao(),
+                        totalChaptersInBook = totalChaptersInBook,
+                        startFromIndex = retryStartFromIndex,
+                        firstChapterName = firstChapterName,
+                        coverImagePath = coverImagePath,
+                        bookEntity = bookEntity,
+                        onError = { error, count ->
+                            if (autoRetryOnTransferError.value && !isRetrying && currentTransferBook != null && currentTransferChapters != null) {
+                                isRetrying = true
+                                addTransferLog("[中断] 传输中断: $error (章节索引: $count)")
+                                addTransferLog("[重试] 5秒后尝试重连...")
+                                pushState.update {
+                                    it.copy(
+                                        statusText = "传输中断，正在重试...",
+                                        isTransferring = true
+                                    )
+                                }
+                                ForegroundTransferService.startService(appContext, "重试中", "传输中断，5秒后重连...", null)
+                                LiveNotificationManager.showTransferNotification("重试中", "传输中断，5秒后重连...", null)
+                                scope.launch {
+                                    retryTransfer(count)
+                                }
+                            } else {
+                                addTransferLog("[错误] 传输失败: $error (章节索引: $count)")
+                                pushState.update {
+                                    it.copy(
+                                        statusText = "传输失败: $error",
+                                        isFinished = true,
+                                        isSuccess = false,
+                                        isTransferring = false
+                                    )
+                                }
+                                ForegroundTransferService.stopService(appContext)
+                                resetTransferState()
+                            }
+                        },
+                        onSuccess = { message, count ->
+                            addTransferLog("[成功] $message，共传输 $count 章")
+                            pushState.update {
+                                it.copy(
+                                    statusText = "传输成功",
+                                    progress = 1.0,
+                                    isFinished = true,
+                                    isSuccess = true,
+                                    isTransferring = false
+                                )
+                            }
+                            ForegroundTransferService.stopService(appContext)
+                            resetTransferState()
+                        },
+                        onProgress = { p, preview, speed ->
+                            val progressPercent = (p * 100).toInt()
+                            val logMessage = if (preview.isNotEmpty()) {
+                                "[$progressPercent%] $preview"
+                            } else {
+                                "[$progressPercent%] 传输中"
+                            }
+                            addTransferLog(logMessage)
+                            pushState.update {
+                                it.copy(
+                                    progress = p,
+                                    preview = preview,
+                                    speed = speed,
+                                    statusText = "正在推送 $progressPercent%",
+                                    isTransferring = true
+                                )
+                            }
+                            val title = "$progressPercent%"
+                            ForegroundTransferService.startService(appContext, title, preview, progressPercent)
+                            LiveNotificationManager.showTransferNotification(title, preview, progressPercent)
+                            
+                            if (retryChapters.isNotEmpty() && p > 0) {
+                                val currentIndex = (p * retryChapters.size).toInt().coerceAtMost(retryChapters.size - 1)
+                                currentTransferChapterIndex = retryChapters[currentIndex]
+                            }
+                        },
+                        onCoverProgress = { current, total ->
+                            if (total > 0) {
+                                val logMessage = "传输封面分块: $current/$total"
+                                addTransferLog(logMessage)
+                                pushState.update {
+                                    it.copy(
+                                        isSendingCover = true,
+                                        coverProgress = "封面: $current/$total",
+                                        isTransferring = true
+                                    )
+                                }
+                            } else {
+                                pushState.update {
+                                    it.copy(isSendingCover = false, coverProgress = "")
+                                }
+                            }
+                        }
+                    )
+                }
+                
+                isRetrying = false
+                return
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    if (retryCount < maxRetryCount) {
+                        addTransferLog("[重试] 重连失败: ${e.message}，5秒后再次尝试... (第${retryCount}/${maxRetryCount}次)")
+                        ForegroundTransferService.startService(appContext, "重试失败", "重连失败: ${e.message}，5秒后重试... (第${retryCount}/${maxRetryCount}次)", null)
+                        LiveNotificationManager.showTransferNotification("重试失败", "重连失败: ${e.message}，5秒后重试... (第${retryCount}/${maxRetryCount}次)", null)
+                    } else {
+                        addTransferLog("[错误] 已达到最大重试次数(${maxRetryCount}次)，传输失败")
+                        pushState.update {
+                            it.copy(
+                                statusText = "已达到最大重试次数，传输失败",
+                                isFinished = true,
+                                isSuccess = false,
+                                isTransferring = false
+                            )
+                        }
+                        ForegroundTransferService.startService(appContext, "传输失败", "已达到最大重试次数(${maxRetryCount}次)，传输失败", null)
+                        LiveNotificationManager.showTransferNotification("传输失败", "已达到最大重试次数(${maxRetryCount}次)，传输失败", null)
+                        delay(2000)
+                        ForegroundTransferService.stopService(appContext)
+                        resetTransferState()
+                        isRetrying = false
+                    }
+                }
+            }
+        }
+        
+        if (isRetrying) {
+            withContext(Dispatchers.Main) {
+                addTransferLog("[错误] 已达到最大重试次数(${maxRetryCount}次)，传输失败")
+                pushState.update {
+                    it.copy(
+                        statusText = "已达到最大重试次数，传输失败",
+                        isFinished = true,
+                        isSuccess = false,
+                        isTransferring = false
+                    )
+                }
+                ForegroundTransferService.startService(appContext, "传输失败", "已达到最大重试次数(${maxRetryCount}次)，传输失败", null)
+                LiveNotificationManager.showTransferNotification("传输失败", "已达到最大重试次数(${maxRetryCount}次)，传输失败", null)
+                delay(2000)
+                ForegroundTransferService.stopService(appContext)
+            }
+            resetTransferState()
+        }
+    }
+
+    private fun resetTransferState() {
+        currentTransferBook = null
+        currentTransferChapters = null
+        currentTransferSyncCover = false
+        currentTransferIsCoverAlreadySynced = false
+        currentTransferChapterIndex = 0
+        isRetrying = false
+    }
+
+    fun cancelPush() {
+        val fileConn = runCatching { connectionHandler.getFileConnection() }.getOrElse { return }
+        if (fileConn.busy) {
+            fileConn.cancel()
+        }
+        runCatching { connectionHandler.getHandshake() }.getOrNull()?.setOnDisconnected { }
+        syncOptionsState.value = null
+        isRetrying = false
+        resetTransferState()
+        resetPushState()
+    }
+
+    fun resetPushState() {
+        pushState.value = PushState()
+        resetTransferState()
+    }
+}
+
